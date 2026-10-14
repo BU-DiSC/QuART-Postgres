@@ -699,3 +699,104 @@ do_insert:
 
 	return found;
 }
+
+/*
+ * RT_SET_QUART_BULK
+ *
+ * Bulk-load a CONTIGUOUS key range (keys[i] == keys[0] + i) at any offset.
+ * The 256-aligned interior is built one full node256 leaf at a time by filling
+ * the children[] array directly (embedded values), rather than descending from
+ * the root per key; the (<256) leading and trailing partials go through RT_SET.
+ * This is the PostgreSQL-radix-tree analogue of ART::bulkLoadRange.
+ *
+ * Requires embeddable values (value size <= pointer size), which the VACUUM
+ * uint64 block-number workload satisfies.
+ */
+RT_SCOPE void
+RT_SET_QUART_BULK(RT_RADIX_TREE *tree, uint64 *keys, RT_VALUE_TYPE *values, size_t n)
+{
+	size_t		firstAligned,
+				g,
+				endAligned,
+				k;
+
+	if (n == 0)
+		return;
+
+	/* Bootstrap the tree, then extend it upward to cover the whole range. */
+	RT_SET(tree, keys[0], &values[0]);
+	if (keys[n - 1] > tree->ctl->max_val)
+		RT_EXTEND_UP(tree, keys[n - 1]);
+
+	/*
+	 * If the tree is too shallow to have a shift-8 parent above the leaves
+	 * (max key < 256), there is no aligned interior worth special-casing;
+	 * fall back to ordinary insertion for every key.
+	 */
+	if (tree->ctl->start_shift < RT_SPAN)
+	{
+		for (k = 1; k < n; k++)
+			RT_SET(tree, keys[k], &values[k]);
+		tree->ctl->num_keys = n;
+		return;
+	}
+
+	/* first index whose value is 256-aligned (low chunk == 0) */
+	firstAligned = 0;
+	while (firstAligned < n && (keys[firstAligned] & RT_CHUNK_MASK) != 0)
+		firstAligned++;
+
+	/* Build each complete 256-aligned group as a single node256 leaf. */
+	for (g = firstAligned; g + RT_NODE_MAX_SLOTS <= n; g += RT_NODE_MAX_SLOTS)
+	{
+		uint64		V = keys[g];	/* (V & RT_CHUNK_MASK) == 0 */
+		RT_PTR_ALLOC *parent_slot = &tree->ctl->root;
+		RT_PTR_ALLOC *slot;
+		RT_CHILD_PTR leaf;
+		RT_NODE_256 *n256;
+		int			shift = tree->ctl->start_shift;
+		int			j;
+
+		/* Ensure the whole path down to shift 0 exists for V. */
+		RT_SET(tree, V, &values[g]);
+
+		/* Navigate existing nodes down to the shift-8 parent of the leaf. */
+		while (shift > RT_SPAN)
+		{
+			RT_CHILD_PTR node;
+
+			node.alloc = *parent_slot;
+			RT_PTR_SET_LOCAL(tree, &node);
+			parent_slot = RT_NODE_SEARCH(node.local, RT_GET_KEY_CHUNK(V, shift));
+			shift -= RT_SPAN;
+		}
+		{
+			RT_CHILD_PTR node8;
+
+			node8.alloc = *parent_slot;
+			RT_PTR_SET_LOCAL(tree, &node8);
+			slot = RT_NODE_SEARCH(node8.local, RT_GET_KEY_CHUNK(V, RT_SPAN));
+		}
+
+		/* Build a full node256 leaf and splice it over the shift-0 node. */
+		leaf = RT_ALLOC_NODE(tree, RT_NODE_KIND_256, RT_CLASS_256);
+		n256 = (RT_NODE_256 *) leaf.local;
+		for (j = 0; j < RT_NODE_MAX_SLOTS; j++)
+		{
+			memcpy(&n256->children[j], &values[g + j], sizeof(RT_VALUE_TYPE));
+			n256->isset[RT_BM_IDX(j)] |= ((bitmapword) 1 << RT_BM_BIT(j));
+		}
+		/* base.count stays 0: a fully-populated node256 overflows to 0 and the
+		 * node256 code never introspects count (lookups use the isset bitmap). */
+		*slot = leaf.alloc;
+	}
+	endAligned = g;
+
+	/* ragged ends via ordinary insertion */
+	for (k = 0; k < firstAligned; k++)
+		RT_SET(tree, keys[k], &values[k]);
+	for (k = endAligned; k < n; k++)
+		RT_SET(tree, keys[k], &values[k]);
+
+	tree->ctl->num_keys = n;
+}

@@ -23,6 +23,7 @@
 #include "storage/lwlock.h"
 #include "utils/array.h"
 #include "utils/memutils.h"
+#include "portability/instr_time.h"
 
 PG_MODULE_MAGIC;
 
@@ -31,6 +32,57 @@ PG_FUNCTION_INFO_V1(do_set_block_offsets);
 PG_FUNCTION_INFO_V1(check_set_block_offsets);
 PG_FUNCTION_INFO_V1(test_is_full);
 PG_FUNCTION_INFO_V1(test_destroy);
+PG_FUNCTION_INFO_V1(bench_tidstore_insert);
+
+/*
+ * Tight in-C benchmark of the real VACUUM TidStore insert path
+ * (TidStoreSetBlockOffsets, which honors the vacuum_use_quart GUC). Inserts
+ * `nblocks` block numbers spaced by `stride`, each with `noffsets` dead
+ * offsets, into a fresh local (insert-only) TidStore, and returns elapsed
+ * seconds. stride=1 => consecutive blocks (matches VACUUM; ~99.6% FP_INSERT).
+ * Isolates insertion CPU from all VACUUM I/O. Toggle ART vs QuART with
+ * `SET vacuum_use_quart = off|on` before calling.
+ */
+Datum
+bench_tidstore_insert(PG_FUNCTION_ARGS)
+{
+	int64		nblocks = PG_GETARG_INT64(0);
+	int32		noffsets = PG_GETARG_INT32(1);
+	int64		stride = PG_GETARG_INT64(2);
+	TidStore   *ts;
+	OffsetNumber *offs;
+	MemoryContext old_ctx;
+	instr_time	start,
+				dur;
+	/* generous memory ceiling so the store never reports full / resets */
+	size_t		max_bytes = (size_t) 32 * 1024 * 1024 * 1024;
+
+	offs = (OffsetNumber *) palloc(sizeof(OffsetNumber) * noffsets);
+	for (int i = 0; i < noffsets; i++)
+		offs[i] = (OffsetNumber) (i + 1);	/* offsets 1..noffsets, ascending */
+
+	old_ctx = MemoryContextSwitchTo(TopMemoryContext);
+	ts = TidStoreCreateLocal(max_bytes, true);	/* insert_only, like VACUUM */
+	MemoryContextSwitchTo(old_ctx);
+
+	INSTR_TIME_SET_CURRENT(start);
+	for (int64 i = 0; i < nblocks; i++)
+	{
+		BlockNumber blk = (BlockNumber) (i * stride);
+
+		TidStoreLockExclusive(ts);
+		TidStoreSetBlockOffsets(ts, blk, offs, noffsets);
+		TidStoreUnlock(ts);
+	}
+	dur = start;
+	INSTR_TIME_SET_CURRENT(dur);
+	INSTR_TIME_SUBTRACT(dur, start);
+
+	TidStoreDestroy(ts);
+	pfree(offs);
+
+	PG_RETURN_FLOAT8(INSTR_TIME_GET_DOUBLE(dur));
+}
 
 static TidStore *tidstore = NULL;
 static size_t tidstore_empty_size;

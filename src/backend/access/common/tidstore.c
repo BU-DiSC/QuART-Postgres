@@ -359,6 +359,39 @@ TidStoreSetBlockOffsets(TidStore *ts, BlockNumber blkno, OffsetNumber *offsets,
 	int			next_word_threshold;
 	int			idx = 0;
 
+	/*
+	 * Instrumentation (env-gated): dump the exact block-number key stream the
+	 * vacuum inserts into the TID-store radix tree, so a standalone radix
+	 * benchmark can replay it. Set QUART_KEYDUMP=/path to enable; keys are
+	 * written as little-endian uint64 (one per SetBlockOffsets call, in
+	 * heap-scan order). Flushed when the backend exits (psql disconnect).
+	 */
+	{
+		static FILE *quart_keydump = NULL;
+		static int	quart_keydump_tried = 0;
+
+		if (!quart_keydump_tried)
+		{
+			const char *p = getenv("QUART_KEYDUMP");
+
+			quart_keydump_tried = 1;
+			if (p != NULL)
+			{
+				char		buf[1024];
+
+				/* per-PID file so parallel vacuums capture into separate streams */
+				snprintf(buf, sizeof(buf), "%s.%d", p, (int) getpid());
+				quart_keydump = fopen(buf, "wb");
+			}
+		}
+		if (quart_keydump != NULL)
+		{
+			uint64		k = (uint64) blkno;
+
+			fwrite(&k, sizeof(k), 1, quart_keydump);
+		}
+	}
+
 	Assert(num_offsets > 0);
 
 	/* Check if the given offset numbers are ordered */

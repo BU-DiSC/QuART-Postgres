@@ -189,6 +189,7 @@
 #define RT_SET RT_MAKE_NAME(set)
 #ifdef RT_USE_QUART
 #define RT_SET_QUART RT_MAKE_NAME(set_quart)
+#define RT_SET_QUART_BULK RT_MAKE_NAME(set_quart_bulk)
 #endif
 #define RT_BEGIN_ITERATE RT_MAKE_NAME(begin_iterate)
 #define RT_ITERATE_NEXT RT_MAKE_NAME(iterate_next)
@@ -318,6 +319,8 @@ RT_SCOPE bool RT_SET(RT_RADIX_TREE * tree, uint64 key, RT_VALUE_TYPE * value_p);
 
 #ifdef RT_USE_QUART
 RT_SCOPE bool RT_SET_QUART(RT_RADIX_TREE * tree, uint64 key, RT_VALUE_TYPE * value_p);
+/* Bulk-load a CONTIGUOUS key range (keys[i]==keys[0]+i) at any offset. */
+RT_SCOPE void RT_SET_QUART_BULK(RT_RADIX_TREE * tree, uint64 * keys, RT_VALUE_TYPE * values, size_t n);
 #endif
 
 #ifdef RT_USE_DELETE
@@ -3426,6 +3429,7 @@ RT_DUMP_NODE(RT_NODE * node)
 #undef RT_SET
 #ifdef RT_USE_QUART
 #undef RT_SET_QUART
+#undef RT_SET_QUART_BULK
 #undef RT_QUART_FAST_PATH
 #undef RT_QUART_CHECK_ASCENDING
 #undef RT_QUART_CHECK_DESCENDING

@@ -2301,6 +2301,14 @@
   check_hook => 'check_primary_slot_name',
 },
 
+{ name => 'quart_keydump_file', type => 'string', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Writes the block numbers VACUUM inserts into its TID store to this file.',
+  long_desc => 'Used to capture key streams for offline QuART replay. An empty string disables the dump.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'quart_keydump_file',
+  boot_val => '""',
+},
+
 { name => 'quote_all_identifiers', type => 'bool', context => 'PGC_USERSET', group => 'COMPAT_OPTIONS_PREVIOUS',
   short_desc => 'When generating SQL fragments, quote all identifiers.',
   variable => 'quote_all_identifiers',

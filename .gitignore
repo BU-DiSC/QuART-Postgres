@@ -50,3 +50,6 @@ lib*.pc
 /pgdata/
 /logfile
 /bench_*
+/quart_bench/replay
+/quart_bench/*.o
+/quart_bench/keybins/

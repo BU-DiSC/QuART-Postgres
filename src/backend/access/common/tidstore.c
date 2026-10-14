@@ -335,6 +335,40 @@ TidStoreDestroy(TidStore *ts)
 }
 
 /*
+ * Append blkno to quart_keydump_file as a little-endian uint64, so the exact
+ * key stream VACUUM inserts into the radix tree can be replayed offline by
+ * quart_bench/.  The file is (re)created whenever the setting changes.
+ */
+static void
+quart_keydump(BlockNumber blkno)
+{
+	static FILE *file = NULL;
+	static char *path = NULL;
+	uint64		key = blkno;
+
+	if (path == NULL || strcmp(path, quart_keydump_file) != 0)
+	{
+		if (file != NULL)
+			fclose(file);
+		if (path != NULL)
+			pfree(path);
+		path = NULL;
+		file = fopen(quart_keydump_file, PG_BINARY_W);
+		if (file == NULL)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not open file \"%s\": %m",
+							quart_keydump_file)));
+		path = MemoryContextStrdup(TopMemoryContext, quart_keydump_file);
+	}
+
+	if (fwrite(&key, sizeof(key), 1, file) != 1 || fflush(file) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write to file \"%s\": %m", path)));
+}
+
+/*
  * Create or replace an entry for the given block and array of offsets.
  *
  * NB: This function is designed and optimized for vacuum's heap scanning
@@ -359,38 +393,9 @@ TidStoreSetBlockOffsets(TidStore *ts, BlockNumber blkno, OffsetNumber *offsets,
 	int			next_word_threshold;
 	int			idx = 0;
 
-	/*
-	 * Instrumentation (env-gated): dump the exact block-number key stream the
-	 * vacuum inserts into the TID-store radix tree, so a standalone radix
-	 * benchmark can replay it. Set QUART_KEYDUMP=/path to enable; keys are
-	 * written as little-endian uint64 (one per SetBlockOffsets call, in
-	 * heap-scan order). Flushed when the backend exits (psql disconnect).
-	 */
-	{
-		static FILE *quart_keydump = NULL;
-		static int	quart_keydump_tried = 0;
-
-		if (!quart_keydump_tried)
-		{
-			const char *p = getenv("QUART_KEYDUMP");
-
-			quart_keydump_tried = 1;
-			if (p != NULL)
-			{
-				char		buf[1024];
-
-				/* per-PID file so parallel vacuums capture into separate streams */
-				snprintf(buf, sizeof(buf), "%s.%d", p, (int) getpid());
-				quart_keydump = fopen(buf, "wb");
-			}
-		}
-		if (quart_keydump != NULL)
-		{
-			uint64		k = (uint64) blkno;
-
-			fwrite(&k, sizeof(k), 1, quart_keydump);
-		}
-	}
+	/* QuART key capture for offline replay (see quart_bench/) */
+	if (quart_keydump_file != NULL && quart_keydump_file[0] != '\0')
+		quart_keydump(blkno);
 
 	Assert(num_offsets > 0);
 

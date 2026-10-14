@@ -82,6 +82,7 @@ double		vacuum_max_eager_freeze_failure_rate;
 bool		track_cost_delay_timing;
 bool		vacuum_truncate;
 bool		vacuum_use_quart;
+char	   *quart_keydump_file = NULL;
 
 /*
  * Variables for cost-based vacuum delay. The defaults differ between

@@ -85,6 +85,11 @@ Density is the gap-free fraction of the inserted block range. The paper uses
    `REPS` (default 10) runs, with the order of the paths rotated per run; the
    median trial is reported. Every tree is checked key by key against the
    stream (`verify` column), so a corrupted tree cannot produce a timing.
+   Like VACUUM's TID store, every tree is built in fresh memory: `replay`
+   hands each freed tree back to the kernel (glibc `mallopt`/`malloc_trim`),
+   since otherwise glibc lets repeated builds of small trees reuse pages that
+   are already mapped, inflating their speedups (for example 8.6× instead of
+   4.0× for bulk on the 1B-row `range25` stream).
 
 `replay` can also be run on a single stream:
 `quart_bench/replay -H [-r REPS] [-t TRIALS] keys.bin`.

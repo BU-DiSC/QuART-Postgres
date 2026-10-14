@@ -17,6 +17,9 @@
  * Each trial times every path "reps" times, rotating the order of the paths
  * per repetition, and keeps the fastest run per path; the reported time is
  * the median over trials.  Every tree is verified against the key stream.
+ * Like VACUUM's TID store, every tree is built in fresh memory: freed trees
+ * are handed back to the kernel, so no build reuses pages already faulted in
+ * by an earlier one (which glibc would otherwise allow for small trees only).
  *
  * Usage: replay [-r reps] [-t trials] [-H] keys.bin
  * Prints one CSV row (with -H, a header line first).
@@ -25,6 +28,7 @@
  */
 #include "postgres.h"
 
+#include <malloc.h>
 #include <time.h>
 
 #include "utils/memutils.h"
@@ -113,7 +117,10 @@ build(int path, rt_radix_tree **tree_out)
 	if (tree_out)
 		*tree_out = tree;
 	else
+	{
 		rt_free(tree);
+		malloc_trim(0);
+	}
 	return start;
 }
 
@@ -209,6 +216,10 @@ main(int argc, char **argv)
 		fprintf(stderr, "usage: %s [-r reps] [-t trials] [-H] keys.bin\n", argv[0]);
 		return 1;
 	}
+
+	/* fixed thresholds: freed trees go back to the kernel (see header) */
+	mallopt(M_MMAP_THRESHOLD, 128 * 1024);
+	mallopt(M_TRIM_THRESHOLD, 0);
 
 	MemoryContextInit();
 	load_keys(file);

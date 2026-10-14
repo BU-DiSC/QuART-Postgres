@@ -15,7 +15,6 @@
 #include "common/int.h"
 #include "common/pg_prng.h"
 #include "fmgr.h"
-#include "portability/instr_time.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
 
@@ -91,21 +90,9 @@ static rt_node_class_test_elem rt_node_class_tests[] =
 };
 
 
-/* Plain ART (no QuART optimization) - used as the baseline */
-#define RT_PREFIX art
-#define RT_SCOPE static
-#define RT_DECLARE
-#define RT_DEFINE
-#define RT_VALUE_TYPE TestValueType
-#ifdef TEST_SHARED_RT
-#define RT_SHMEM
-#endif
-#define RT_DEBUG
-#include "lib/radixtree.h"
-
-/* QuART tree - uses quart.h implementation via RT_SET_QUART */
+/* define the radix tree implementations to test */
 #define RT_PREFIX quart
-#define RT_SCOPE static
+#define RT_SCOPE
 #define RT_DECLARE
 #define RT_DEFINE
 #define RT_USE_QUART
@@ -116,7 +103,6 @@ static rt_node_class_test_elem rt_node_class_tests[] =
 #define RT_DEBUG
 #include "lib/radixtree.h"
 
-/* rt_ tree used by the existing basic/random tests (with delete support) */
 #define RT_PREFIX rt
 #define RT_SCOPE
 #define RT_DECLARE
@@ -143,8 +129,7 @@ PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(test_radixtree);
 
-static int	key_cmp(const void *a, const void *b);
-static void test_quart_sequential(void);
+static void test_quart(void);
 
 static void
 test_empty(void)
@@ -482,89 +467,79 @@ test_radixtree(PG_FUNCTION_ARGS)
 	}
 
 	test_random();
-	test_quart_sequential();
+	test_quart();
 
 	PG_RETURN_VOID();
 }
 
 /*
- * Test QuART vs plain ART with 5 million consecutive ascending key inserts.
- *
- * Inserts keys 0..4999999 into both a plain ART tree (art_set) and a QuART
- * tree (quart_set_quart), verifies correctness of both, and reports timing.
+ * Test QuART fast-path insertion against plain insertion.  The key stream is
+ * near-sorted, starts above 255, has outliers in other groups, and mixes in
+ * plain quart_set() calls, all of which used to corrupt the QuART tree.
  */
 static void
-test_quart_sequential(void)
+test_quart(void)
 {
-#define QUART_SEQ_N 5000000
+	quart_radix_tree *quarttree;
+	rt_radix_tree *radixtree;
+	quart_iter *iter;
+	pg_prng_state state;
+	uint64		key;
+	TestValueType *val;
+	int			num_keys = 100000;
+	int64		num_iterated = 0;
+#ifdef TEST_SHARED_RT
+	int			tranche_id = LWLockNewTrancheId("test_radix_tree");
+	dsa_area   *dsa;
 
-	art_radix_tree *art_tree;
-	quart_radix_tree *quart_tree;
-	MemoryContext art_ctx;
-	MemoryContext quart_ctx;
-	instr_time	start,
-				art_elapsed,
-				quart_elapsed;
+	dsa = dsa_create(tranche_id);
+	quarttree = quart_create(dsa, tranche_id);
+	radixtree = rt_create(dsa, tranche_id);
+#else
+	MemoryContext radixtree_ctx;
 
-	art_ctx = AllocSetContextCreate(CurrentMemoryContext,
-									"art_seq_test",
-									ALLOCSET_DEFAULT_SIZES);
-	quart_ctx = AllocSetContextCreate(CurrentMemoryContext,
-									  "quart_seq_test",
-									  ALLOCSET_DEFAULT_SIZES);
+	radixtree_ctx = AllocSetContextCreate(CurrentMemoryContext,
+										  "test_radix_tree",
+										  ALLOCSET_DEFAULT_SIZES);
+	quarttree = quart_create(radixtree_ctx);
+	radixtree = rt_create(radixtree_ctx);
+#endif
 
-	art_tree = art_create(art_ctx);
-	quart_tree = quart_create(quart_ctx);
-
-	/* --- insert into plain ART --- */
-	INSTR_TIME_SET_CURRENT(start);
-	for (uint64 i = 0; i < QUART_SEQ_N; i++)
+	pg_prng_seed(&state, 0);
+	for (int i = 0; i < num_keys; i++)
 	{
-		TestValueType val = i;
+		TestValueType v;
 
-		art_set(art_tree, i, &val);
-	}
-	INSTR_TIME_SET_CURRENT(art_elapsed);
-	INSTR_TIME_SUBTRACT(art_elapsed, start);
+		if (pg_prng_uint32(&state) % 100 < 5)
+			key = pg_prng_uint32(&state) % (1 << 24);	/* outlier */
+		else
+			key = 1000 + i;
+		v = (TestValueType) key;
 
-	/* --- insert into QuART --- */
-	INSTR_TIME_SET_CURRENT(start);
-	for (uint64 i = 0; i < QUART_SEQ_N; i++)
-	{
-		TestValueType val = i;
-
-		quart_set_quart(quart_tree, i, &val);
-	}
-	INSTR_TIME_SET_CURRENT(quart_elapsed);
-	INSTR_TIME_SUBTRACT(quart_elapsed, start);
-
-	elog(NOTICE,
-		 "sequential ascending insert of %d keys: ART %.3f ms, QuART %.3f ms",
-		 QUART_SEQ_N,
-		 INSTR_TIME_GET_MILLISEC(art_elapsed),
-		 INSTR_TIME_GET_MILLISEC(quart_elapsed));
-
-	/* verify key count */
-	EXPECT_TRUE(art_tree->ctl->num_keys == QUART_SEQ_N);
-	EXPECT_TRUE(quart_tree->ctl->num_keys == QUART_SEQ_N);
-
-	/* verify all keys are present with correct values in both trees */
-	for (uint64 i = 0; i < QUART_SEQ_N; i++)
-	{
-		TestValueType *art_val = art_find(art_tree, i);
-		TestValueType *quart_val = quart_find(quart_tree, i);
-
-		EXPECT_TRUE(art_val != NULL);
-		EXPECT_EQ_U64(*art_val, i);
-
-		EXPECT_TRUE(quart_val != NULL);
-		EXPECT_EQ_U64(*quart_val, i);
+		if (i % 7 == 3)
+			quart_set(quarttree, key, &v);
+		else
+			quart_set_quart(quarttree, key, &v);
+		rt_set(radixtree, key, &v);
 	}
 
-	art_free(art_tree);
-	quart_free(quart_tree);
-	MemoryContextDelete(art_ctx);
-	MemoryContextDelete(quart_ctx);
+	/* the QuART tree must hold exactly the keys of the plain tree */
+	EXPECT_EQ_U64(quarttree->ctl->num_keys, rt_num_entries(radixtree));
 
-#undef QUART_SEQ_N
+	iter = quart_begin_iterate(quarttree);
+	while ((val = quart_iterate_next(iter, &key)) != NULL)
+	{
+		EXPECT_EQ_U64(*val, key);
+		EXPECT_TRUE(rt_find(radixtree, key) != NULL);
+		num_iterated++;
+	}
+	quart_end_iterate(iter);
+	EXPECT_EQ_U64(num_iterated, rt_num_entries(radixtree));
+
+	quart_free(quarttree);
+	rt_free(radixtree);
+
+#ifdef TEST_SHARED_RT
+	dsa_detach(dsa);
+#endif
 }

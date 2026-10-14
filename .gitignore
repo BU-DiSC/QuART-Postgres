@@ -43,3 +43,10 @@ lib*.pc
 /Release/
 /tmp_install/
 /portlock/
+
+# QuART local artifacts
+/.claude/
+/install/
+/pgdata/
+/logfile
+/bench_*

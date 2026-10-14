@@ -125,7 +125,7 @@
  * RT_FIND			- Lookup the value for a given key
  * RT_SET			- Set a key-value pair
  * RT_SET_QUART		- Set a key-value pair via the QuART fast path (RT_USE_QUART)
- * RT_SET_QUART_BULK - Bulk-load a contiguous sorted key range (RT_USE_QUART)
+ * RT_SET_QUART_BULK - Bulk-load a sorted key array (RT_USE_QUART)
  * RT_BEGIN_ITERATE	- Begin iterating through all key-value pairs
  * RT_ITERATE_NEXT	- Return next key-value pair, if any
  * RT_END_ITERATE	- End iteration
@@ -251,6 +251,8 @@
 #ifdef RT_USE_QUART
 #define RT_QUART_LOCATE_FP RT_MAKE_NAME(quart_locate_fp)
 #define RT_QUART_STORE_VALUE RT_MAKE_NAME(quart_store_value)
+#define RT_QUART_BULK_PATH RT_MAKE_NAME(quart_bulk_path)
+#define RT_QUART_BULK_GROUP RT_MAKE_NAME(quart_bulk_group)
 #endif
 
 /* type declarations */
@@ -304,7 +306,7 @@ RT_SCOPE bool RT_SET(RT_RADIX_TREE * tree, uint64 key, RT_VALUE_TYPE * value_p);
 
 #ifdef RT_USE_QUART
 RT_SCOPE bool RT_SET_QUART(RT_RADIX_TREE * tree, uint64 key, RT_VALUE_TYPE * value_p);
-/* Bulk-load a contiguous key range; unused by tidstore, used by benchmarks */
+/* Bulk-load a sorted key array; unused by tidstore, used by benchmarks */
 pg_attribute_unused() RT_SCOPE void RT_SET_QUART_BULK(RT_RADIX_TREE * tree, uint64 * keys, RT_VALUE_TYPE * values, size_t n);
 #endif
 
@@ -3019,6 +3021,8 @@ RT_DUMP_NODE(RT_NODE * node)
 #undef RT_SET_QUART_BULK
 #undef RT_QUART_LOCATE_FP
 #undef RT_QUART_STORE_VALUE
+#undef RT_QUART_BULK_PATH
+#undef RT_QUART_BULK_GROUP
 #endif
 #undef RT_USE_QUART
 #undef RT_BEGIN_ITERATE

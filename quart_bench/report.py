@@ -5,7 +5,8 @@ Usage: report.py [results/replay.csv]
 
 Rows are workloads W1..W9, columns are table scales. "stail over ART" is
 RT_SET time / RT_SET_QUART time; "Bulk load over ART" is RT_SET time / guarded
-bulk-load time, shown only for streams the guard admits (contiguous ones).
+bulk-load time, shown only for streams the guard admits (strictly ascending
+ones).
 """
 import csv
 import sys
@@ -42,7 +43,7 @@ def main():
             continue
         density = next(float(c["density"]) for c in present if c)
         stail = [f"{float(c['stail_speedup']):.2f}" if c else "" for c in present]
-        bulk = [(f"{float(c['bulk_speedup']):.2f}" if c["contiguous"] == "yes"
+        bulk = [(f"{float(c['bulk_speedup']):.2f}" if c["sorted"] == "yes"
                  else "--") if c else "" for c in present]
         print(f"| {wid} {wl} | {density:.2f} | " + " | ".join(stail + bulk) + " |")
 

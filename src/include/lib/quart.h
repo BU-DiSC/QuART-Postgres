@@ -3,9 +3,9 @@
  * quart.h
  *		QuART (Quick Adaptive Radix Tree) extension for radixtree.h
  *
- * This file contains the QuART stail fast-path insertion for the adaptive
- * radix tree template.  It is included by radixtree.h when RT_USE_QUART is
- * defined.
+ * This file contains the QuART stail fast-path insertion and grouped bulk
+ * loading for the adaptive radix tree template.  It is included by
+ * radixtree.h when RT_USE_QUART is defined.
  *
  * The tree caches a fast pointer "fp" to the shift-0 node (the parent of the
  * leaves) of the 256-key group (key >> RT_SPAN) most recently reached via a
@@ -206,105 +206,220 @@ change_fp:
 }
 
 /*
+ * Return the slot holding the shift-RT_SPAN node on the path to "key" (the
+ * parent of key's shift-0 node), creating any missing nodes above it.  This
+ * is getOrCreatePath() of the bulk loader.  Requires start_shift >= RT_SPAN.
+ */
+static RT_PTR_ALLOC *
+RT_QUART_BULK_PATH(RT_RADIX_TREE * tree, uint64 key)
+{
+	RT_PTR_ALLOC *parent_slot = &tree->ctl->root;
+	int			shift = tree->ctl->start_shift;
+
+	while (shift > RT_SPAN)
+	{
+		RT_CHILD_PTR node;
+		RT_PTR_ALLOC *slot;
+		uint8		chunk = RT_GET_KEY_CHUNK(key, shift);
+
+		node.alloc = *parent_slot;
+		RT_PTR_SET_LOCAL(tree, &node);
+		slot = RT_NODE_SEARCH(node.local, chunk);
+		if (slot == NULL)
+		{
+			slot = RT_NODE_INSERT(tree, parent_slot, node, chunk);
+			*slot = RT_ALLOC_NODE(tree, RT_NODE_KIND_4, RT_CLASS_4).alloc;
+		}
+		parent_slot = slot;
+		shift -= RT_SPAN;
+	}
+
+	return parent_slot;
+}
+
+/*
+ * Build the shift-0 node for the group keys[0..m-1] (1 <= m <= 256 sorted,
+ * unique keys sharing key >> RT_SPAN) at its final size: the smallest node
+ * kind and size class that holds m children, filled in chunk order.
+ */
+static RT_PTR_ALLOC
+RT_QUART_BULK_GROUP(RT_RADIX_TREE * tree, uint64 *keys, RT_VALUE_TYPE * values,
+					size_t m)
+{
+	RT_CHILD_PTR node;
+
+	if (m <= RT_FANOUT_4)
+	{
+		RT_NODE_4  *n4;
+
+		node = RT_ALLOC_NODE(tree, RT_NODE_KIND_4, RT_CLASS_4);
+		n4 = (RT_NODE_4 *) node.local;
+		for (size_t k = 0; k < m; k++)
+		{
+			n4->chunks[k] = RT_GET_KEY_CHUNK(keys[k], 0);
+			RT_QUART_STORE_VALUE(tree, &n4->children[k], false, &values[k]);
+		}
+	}
+	else if (m <= RT_FANOUT_16_HI)
+	{
+		RT_NODE_16 *n16;
+
+		node = RT_ALLOC_NODE(tree, RT_NODE_KIND_16,
+							 m <= RT_FANOUT_16_LO ? RT_CLASS_16_LO : RT_CLASS_16_HI);
+		n16 = (RT_NODE_16 *) node.local;
+		for (size_t k = 0; k < m; k++)
+		{
+			n16->chunks[k] = RT_GET_KEY_CHUNK(keys[k], 0);
+			RT_QUART_STORE_VALUE(tree, &n16->children[k], false, &values[k]);
+		}
+	}
+	else if (m <= RT_FANOUT_48)
+	{
+		RT_NODE_48 *n48;
+
+		node = RT_ALLOC_NODE(tree, RT_NODE_KIND_48, RT_CLASS_48);
+		n48 = (RT_NODE_48 *) node.local;
+		for (size_t k = 0; k < m; k++)
+		{
+			n48->slot_idxs[RT_GET_KEY_CHUNK(keys[k], 0)] = k;
+			n48->isset[RT_BM_IDX(k)] |= ((bitmapword) 1 << RT_BM_BIT(k));
+			RT_QUART_STORE_VALUE(tree, &n48->children[k], false, &values[k]);
+		}
+	}
+	else
+	{
+		RT_NODE_256 *n256;
+
+		node = RT_ALLOC_NODE(tree, RT_NODE_KIND_256, RT_CLASS_256);
+		n256 = (RT_NODE_256 *) node.local;
+		if (m == RT_NODE_MAX_SLOTS)
+		{
+			/* full group: the chunk of keys[k] is k */
+			memset(n256->isset, 0xFF, sizeof(n256->isset));
+			for (size_t k = 0; k < m; k++)
+				RT_QUART_STORE_VALUE(tree, &n256->children[k], false, &values[k]);
+		}
+		else
+		{
+			for (size_t k = 0; k < m; k++)
+			{
+				uint8		chunk = RT_GET_KEY_CHUNK(keys[k], 0);
+
+				n256->isset[RT_BM_IDX(chunk)] |= ((bitmapword) 1 << RT_BM_BIT(chunk));
+				RT_QUART_STORE_VALUE(tree, &n256->children[chunk], false, &values[k]);
+			}
+		}
+	}
+
+	/* overflows to 0 for a full node256, as the node256 code expects */
+	node.local->count = m;
+	RT_VERIFY_NODE(node.local);
+
+	return node.alloc;
+}
+
+/*
  * RT_SET_QUART_BULK
  *
- * Bulk-load a CONTIGUOUS key range (keys[i] == keys[0] + i) at any offset.
- * The 256-aligned interior is built one full node256 leaf at a time by filling
- * the children[] array directly (embedded values), rather than descending from
- * the root per key; the (<256) leading and trailing partials go through RT_SET.
- * This is the PostgreSQL-radix-tree analogue of ART::bulkLoadRange.
+ * Grouped bulk loading of a sorted key array (paper §3.4, Algorithm 2), the
+ * PostgreSQL-radix-tree analogue of ART::bulkLoad.  Keys must be strictly
+ * ascending; gaps and arbitrary offsets are allowed.
  *
- * Requires embeddable values (value size <= pointer size), which the VACUUM
- * uint64 block-number workload satisfies.
+ * A group is the maximal run of keys sharing key >> RT_SPAN; its 1..256 keys
+ * differ only in the shift-0 chunk, so the group's shift-0 node is built
+ * directly at its final size and attached under "cursor", the shift-RT_SPAN
+ * node for the current key >> (2 * RT_SPAN) prefix, with no per-key root-down
+ * descent:
+ *
+ * - BL_FP_INSERT: same prefix as the previous group -> stay under cursor
+ * - BL_BRIDGE:	new prefix (or first group) -> getOrCreatePath moves cursor
+ *
+ * Since the input is sorted, a prefix is never revisited once left, so the
+ * slot holding cursor stays valid until the next bridge.  PostgreSQL's radix
+ * tree has no lazy expansion, so a single-key group gets a node4 like RT_SET
+ * would create.  If the tree already has a shift-0 node for a group, that
+ * group falls back to RT_SET.  Existing shift-0 nodes are never replaced, so
+ * the stail fast path stays valid.
  */
 RT_SCOPE void
-RT_SET_QUART_BULK(RT_RADIX_TREE *tree, uint64 *keys, RT_VALUE_TYPE *values, size_t n)
+RT_SET_QUART_BULK(RT_RADIX_TREE * tree, uint64 *keys, RT_VALUE_TYPE * values, size_t n)
 {
-	size_t		firstAligned,
-				g,
-				endAligned,
-				k;
+	RT_PTR_ALLOC *cursor_slot = NULL;
+	uint64		cursor_prefix = 0;
+	size_t		i,
+				j;
+
+#ifdef RT_SHMEM
+	Assert(tree->ctl->magic == RT_RADIX_TREE_MAGIC);
+#endif
 
 	if (n == 0)
 		return;
 
-	/* leaf nodes are spliced in below without RT_FREE_NODE: drop the fast path */
-	tree->ctl->fp = RT_INVALID_PTR_ALLOC;
-
-	/* Bootstrap the tree, then extend it upward to cover the whole range. */
-	RT_SET(tree, keys[0], &values[0]);
+	/* Make the tree tall enough for the largest key. */
 	if (keys[n - 1] > tree->ctl->max_val)
-		RT_EXTEND_UP(tree, keys[n - 1]);
+	{
+		if (tree->ctl->num_keys == 0)
+		{
+			/* as in RT_SET, reuse the empty root rather than extending up */
+			tree->ctl->start_shift = RT_KEY_GET_SHIFT(keys[n - 1]);
+			tree->ctl->max_val = RT_SHIFT_GET_MAX_VAL(tree->ctl->start_shift);
+		}
+		else
+			RT_EXTEND_UP(tree, keys[n - 1]);
+	}
 
-	/*
-	 * If the tree is too shallow to have a shift-8 parent above the leaves
-	 * (max key < 256), there is no aligned interior worth special-casing;
-	 * fall back to ordinary insertion for every key.
-	 */
+	/* every key is below 256: a single group in the root, nothing to gain */
 	if (tree->ctl->start_shift < RT_SPAN)
 	{
-		for (k = 1; k < n; k++)
-			RT_SET(tree, keys[k], &values[k]);
-		tree->ctl->num_keys = n;
+		for (i = 0; i < n; i++)
+			RT_SET(tree, keys[i], &values[i]);
 		return;
 	}
 
-	/* first index whose value is 256-aligned (low chunk == 0) */
-	firstAligned = 0;
-	while (firstAligned < n && (keys[firstAligned] & RT_CHUNK_MASK) != 0)
-		firstAligned++;
-
-	/* Build each complete 256-aligned group as a single node256 leaf. */
-	for (g = firstAligned; g + RT_NODE_MAX_SLOTS <= n; g += RT_NODE_MAX_SLOTS)
+	for (i = 0; i < n; i = j)
 	{
-		uint64		V = keys[g];	/* (V & RT_CHUNK_MASK) == 0 */
-		RT_PTR_ALLOC *parent_slot = &tree->ctl->root;
-		RT_PTR_ALLOC *slot;
-		RT_CHILD_PTR leaf;
-		RT_NODE_256 *n256;
-		int			shift = tree->ctl->start_shift;
-		int			j;
+		uint64		group = keys[i] >> RT_SPAN;
+		uint8		chunk = RT_GET_KEY_CHUNK(keys[i], RT_SPAN);
+		RT_CHILD_PTR cursor;
 
-		/* Ensure the whole path down to shift 0 exists for V. */
-		RT_SET(tree, V, &values[g]);
+		/* the group is keys[i..j); a full one is detected in O(1) */
+		if (i + RT_NODE_MAX_SLOTS <= n &&
+			keys[i + RT_NODE_MAX_SLOTS - 1] >> RT_SPAN == group)
+			j = i + RT_NODE_MAX_SLOTS;
+		else
+			for (j = i + 1; j < n && keys[j] >> RT_SPAN == group; j++)
+				;
 
-		/* Navigate existing nodes down to the shift-8 parent of the leaf. */
-		while (shift > RT_SPAN)
+#ifdef USE_ASSERT_CHECKING
+		for (size_t k = i + 1; k < j; k++)
+			Assert(keys[k - 1] < keys[k]);
+		Assert(j == n || keys[j - 1] < keys[j]);
+#endif
+
+		/* BL_BRIDGE: move cursor to the new prefix */
+		if (cursor_slot == NULL || group >> RT_SPAN != cursor_prefix)
 		{
-			RT_CHILD_PTR node;
-
-			node.alloc = *parent_slot;
-			RT_PTR_SET_LOCAL(tree, &node);
-			parent_slot = RT_NODE_SEARCH(node.local, RT_GET_KEY_CHUNK(V, shift));
-			shift -= RT_SPAN;
-		}
-		{
-			RT_CHILD_PTR node8;
-
-			node8.alloc = *parent_slot;
-			RT_PTR_SET_LOCAL(tree, &node8);
-			slot = RT_NODE_SEARCH(node8.local, RT_GET_KEY_CHUNK(V, RT_SPAN));
+			cursor_slot = RT_QUART_BULK_PATH(tree, keys[i]);
+			cursor_prefix = group >> RT_SPAN;
 		}
 
-		/* Build a full node256 leaf and splice it over the shift-0 node. */
-		leaf = RT_ALLOC_NODE(tree, RT_NODE_KIND_256, RT_CLASS_256);
-		n256 = (RT_NODE_256 *) leaf.local;
-		for (j = 0; j < RT_NODE_MAX_SLOTS; j++)
+		/* BL_FP_INSERT (and after a bridge): hang the group under cursor */
+		cursor.alloc = *cursor_slot;
+		RT_PTR_SET_LOCAL(tree, &cursor);
+		if (RT_NODE_SEARCH(cursor.local, chunk) == NULL)
 		{
-			memcpy(&n256->children[j], &values[g + j], sizeof(RT_VALUE_TYPE));
-			n256->isset[RT_BM_IDX(j)] |= ((bitmapword) 1 << RT_BM_BIT(j));
+			RT_PTR_ALLOC groupnode = RT_QUART_BULK_GROUP(tree, &keys[i],
+														 &values[i], j - i);
+
+			*RT_NODE_INSERT(tree, cursor_slot, cursor, chunk) = groupnode;
+			tree->ctl->num_keys += j - i;
 		}
-		/* base.count stays 0: a fully-populated node256 overflows to 0 and the
-		 * node256 code never introspects count (lookups use the isset bitmap). */
-		*slot = leaf.alloc;
+		else
+		{
+			/* the group's node already exists (non-empty tree) */
+			for (size_t k = i; k < j; k++)
+				RT_SET(tree, keys[k], &values[k]);
+		}
 	}
-	endAligned = g;
-
-	/* ragged ends via ordinary insertion */
-	for (k = 0; k < firstAligned; k++)
-		RT_SET(tree, keys[k], &values[k]);
-	for (k = endAligned; k < n; k++)
-		RT_SET(tree, keys[k], &values[k]);
-
-	tree->ctl->num_keys = n;
 }

@@ -14,9 +14,12 @@ difference isolates the insertion path:
 | `stail` | `RT_SET_QUART`          | stail over ART          |
 | `bulk`  | guard + `RT_SET_QUART_BULK`, else `RT_SET_QUART` | Bulk load over ART |
 
-The guard is one linear pass that admits a contiguous stream
-(`keys[i] == keys[0] + i`, at any offset) to the bulk loader; gapped streams
-fall back to the stail fast path and get no bulk entry in the table.
+The guard is one linear pass that admits a strictly ascending stream to the
+bulk loader; any other stream falls back to the stail fast path. Gaps and
+offsets are allowed: the loader groups keys by `key >> 8` and builds each
+group's leaf-level node at its final size (node4 to node256), so gaps only make
+groups smaller. A VACUUM stream is always ascending, so every workload is bulk
+loaded.
 
 ## Workloads
 
@@ -89,7 +92,7 @@ Density is the gap-free fraction of the inserted block range. The paper uses
 ## Output
 
 `results/replay.csv` has one row per stream: `keys`, `min_key`/`max_key`,
-`density`, whether the guard admits it (`contiguous`), ns per key for each path
+`density`, whether the guard admits it (`sorted`), ns per key for each path
 (`art_ns`, `stail_ns`, `bulk_ns`), the speedups over `art`, the path the guarded
 loader took (`bulk_path`), the guard's own cost (`guard_ns`) and `verify`.
 The checked-in file is a reference run of the 27 paper streams; numbers depend

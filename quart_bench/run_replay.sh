@@ -22,7 +22,7 @@ if [[ ! -x $HERE/replay ]]; then
 fi
 mkdir -p "$(dirname "$OUT")"
 
-echo "scale,workload,keys,min_key,max_key,density,contiguous,art_ns,stail_ns,stail_speedup,bulk_path,bulk_ns,bulk_speedup,guard_ns,verify" > "$OUT"
+echo "scale,workload,keys,min_key,max_key,density,sorted,art_ns,stail_ns,stail_speedup,bulk_path,bulk_ns,bulk_speedup,guard_ns,verify" > "$OUT"
 
 status=0
 for f in "$KEYBINS"/vackeys_*rows*.bin; do

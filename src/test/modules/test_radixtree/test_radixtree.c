@@ -130,6 +130,7 @@ PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(test_radixtree);
 
 static void test_quart(void);
+static void test_quart_bulk(void);
 
 static void
 test_empty(void)
@@ -468,6 +469,7 @@ test_radixtree(PG_FUNCTION_ARGS)
 
 	test_random();
 	test_quart();
+	test_quart_bulk();
 
 	PG_RETURN_VOID();
 }
@@ -542,4 +544,153 @@ test_quart(void)
 #ifdef TEST_SHARED_RT
 	dsa_detach(dsa);
 #endif
+}
+
+/*
+ * Build a QuART tree by inserting "pre" with quart_set_quart(), bulk-loading
+ * "keys" (strictly ascending) and inserting "post" with quart_set_quart(), and
+ * check that it holds exactly what plain rt_set() calls produce.
+ */
+static void
+test_quart_bulk_case(uint64 *pre, int npre, uint64 *keys, int nkeys,
+					 uint64 *post, int npost)
+{
+	quart_radix_tree *quarttree;
+	rt_radix_tree *radixtree;
+	quart_iter *iter;
+	TestValueType *values;
+	TestValueType *val;
+	uint64		key;
+	int64		num_iterated = 0;
+#ifdef TEST_SHARED_RT
+	int			tranche_id = LWLockNewTrancheId("test_radix_tree");
+	dsa_area   *dsa;
+
+	dsa = dsa_create(tranche_id);
+	quarttree = quart_create(dsa, tranche_id);
+	radixtree = rt_create(dsa, tranche_id);
+#else
+	MemoryContext radixtree_ctx;
+
+	radixtree_ctx = AllocSetContextCreate(CurrentMemoryContext,
+										  "test_radix_tree",
+										  ALLOCSET_DEFAULT_SIZES);
+	quarttree = quart_create(radixtree_ctx);
+	radixtree = rt_create(radixtree_ctx);
+#endif
+
+	for (int i = 0; i < npre; i++)
+	{
+		quart_set_quart(quarttree, pre[i], (TestValueType *) &pre[i]);
+		rt_set(radixtree, pre[i], (TestValueType *) &pre[i]);
+	}
+
+	values = palloc(sizeof(TestValueType) * Max(nkeys, 1));
+	for (int i = 0; i < nkeys; i++)
+	{
+		values[i] = (TestValueType) keys[i];
+		rt_set(radixtree, keys[i], &values[i]);
+	}
+	quart_set_quart_bulk(quarttree, keys, values, nkeys);
+	pfree(values);
+
+	for (int i = 0; i < npost; i++)
+	{
+		quart_set_quart(quarttree, post[i], (TestValueType *) &post[i]);
+		rt_set(radixtree, post[i], (TestValueType *) &post[i]);
+	}
+
+	EXPECT_EQ_U64(quarttree->ctl->num_keys, rt_num_entries(radixtree));
+
+	iter = quart_begin_iterate(quarttree);
+	while ((val = quart_iterate_next(iter, &key)) != NULL)
+	{
+		EXPECT_EQ_U64(*val, key);
+		EXPECT_TRUE(rt_find(radixtree, key) != NULL);
+		num_iterated++;
+	}
+	quart_end_iterate(iter);
+	EXPECT_EQ_U64(num_iterated, rt_num_entries(radixtree));
+
+	quart_free(quarttree);
+	rt_free(radixtree);
+
+#ifdef TEST_SHARED_RT
+	dsa_detach(dsa);
+#endif
+}
+
+/*
+ * Test grouped bulk loading on dense, gapped and offset sorted streams, whose
+ * groups cover every node size class, and its interaction with the stail fast
+ * path on a non-empty tree.
+ */
+static void
+test_quart_bulk(void)
+{
+	/* max gap between consecutive keys; 1 is dense */
+	static const int max_gaps[] = {1, 2, 3, 6, 9, 20, 300, 100000};
+	int			num_keys = 50000;
+	uint64	   *keys = palloc(sizeof(uint64) * num_keys);
+	uint64	   *other = palloc(sizeof(uint64) * num_keys);
+	pg_prng_state state;
+	uint64		key;
+	int			n;
+
+	pg_prng_seed(&state, 0);
+
+	for (int g = 0; g < lengthof(max_gaps); g++)
+	{
+		key = 1000;
+		for (int i = 0; i < num_keys; i++)
+		{
+			keys[i] = key;
+			key += 1 + pg_prng_uint64_range(&state, 0, max_gaps[g] - 1);
+		}
+		test_quart_bulk_case(NULL, 0, keys, num_keys, NULL, 0);
+	}
+
+	/* dense bands separated by gaps, starting at a 64-bit offset */
+	key = UINT64CONST(0x7FFFFFFF00000000);
+	n = 0;
+	while (n < num_keys)
+	{
+		int			band = 1 + pg_prng_uint64_range(&state, 0, 1000);
+
+		for (int i = 0; i < band && n < num_keys; i++)
+			keys[n++] = key++;
+		key += pg_prng_uint64_range(&state, 1, 5000);
+	}
+	test_quart_bulk_case(NULL, 0, keys, num_keys, NULL, 0);
+
+	/* the highest keys, a lone key, keys that fit in the root, no keys */
+	for (int i = 0; i < 300; i++)
+		keys[i] = PG_UINT64_MAX - 299 + i;
+	test_quart_bulk_case(NULL, 0, keys, 300, NULL, 0);
+	keys[0] = 123456789;
+	test_quart_bulk_case(NULL, 0, keys, 1, NULL, 0);
+	for (int i = 0; i < 100; i++)
+		keys[i] = 2 * i;
+	test_quart_bulk_case(NULL, 0, keys, 100, NULL, 0);
+	test_quart_bulk_case(NULL, 0, keys, 0, NULL, 0);
+
+	/*
+	 * Non-empty tree: existing keys, some in the bulk-loaded groups and some
+	 * below 256 so that the bulk load extends the tree upward; then stail
+	 * inserts into the bulk-loaded groups.
+	 */
+	for (int i = 0; i < num_keys; i++)
+		keys[i] = 100000 + 3 * i;
+	for (int i = 0; i < 1000; i++)
+		other[i] = pg_prng_uint64_range(&state, 0, 300000);
+	other[1000] = 7;
+	test_quart_bulk_case(other + 1000, 1, keys, num_keys, other, 1001);
+	test_quart_bulk_case(other, 1001, keys, num_keys, NULL, 0);
+	for (int i = 0; i < num_keys; i++)
+		other[i] = keys[i] + 1;
+	test_quart_bulk_case(NULL, 0, keys, num_keys, other, num_keys);
+	test_quart_bulk_case(keys + 1, num_keys - 1, keys, num_keys, NULL, 0);
+
+	pfree(keys);
+	pfree(other);
 }

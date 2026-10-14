@@ -7,7 +7,7 @@
  *		art   - RT_SET, one root-down descent per key (PostgreSQL's ART)
  *		stail - RT_SET_QUART, the QuART stail fast path
  *		bulk  - guarded bulk loading: a linear guard pass admits a
- *				contiguous stream (keys[i] == keys[0] + i, any offset) to
+ *				strictly ascending stream (gaps and offsets allowed) to
  *				RT_SET_QUART_BULK; any other stream goes to RT_SET_QUART
  *
  * No server, TID store, I/O or WAL is involved: the same keys go through the
@@ -44,7 +44,7 @@ static uint64 *keys;
 static uint64 *values;
 static size_t nkeys;
 static size_t ndistinct;
-static bool contiguous;
+static bool sorted_stream;
 
 static double
 now_sec(void)
@@ -73,12 +73,12 @@ cmp_double(const void *a, const void *b)
 	return (x > y) - (x < y);
 }
 
-/* the bulk guard: one linear pass, stopping at the first gap */
+/* the bulk guard: one linear pass, stopping at the first out-of-order key */
 static bool
-guard_contiguous(void)
+guard_sorted(void)
 {
 	for (size_t i = 1; i < nkeys; i++)
-		if (keys[i] != keys[i - 1] + 1)
+		if (keys[i] <= keys[i - 1])
 			return false;
 	return nkeys > 0;
 }
@@ -101,7 +101,7 @@ build(int path, rt_radix_tree **tree_out)
 				rt_set_quart(tree, keys[i], &values[i]);
 			break;
 		case 2:
-			if (guard_contiguous())
+			if (guard_sorted())
 				rt_set_quart_bulk(tree, keys, values, nkeys);
 			else
 				for (size_t i = 0; i < nkeys; i++)
@@ -175,7 +175,7 @@ load_keys(const char *file)
 			ndistinct++;
 	free(sorted);
 
-	contiguous = guard_contiguous();
+	sorted_stream = guard_sorted();
 }
 
 int
@@ -253,7 +253,7 @@ main(int argc, char **argv)
 	for (int r = 0; r < reps; r++)
 	{
 		double		start = now_sec();
-		volatile bool admitted = guard_contiguous();
+		volatile bool admitted = guard_sorted();
 
 		(void) admitted;
 		guard_best = Min(guard_best, now_sec() - start);
@@ -263,15 +263,15 @@ main(int argc, char **argv)
 		ok &= verify(p);
 
 	if (header)
-		printf("file,keys,min_key,max_key,density,contiguous,"
+		printf("file,keys,min_key,max_key,density,sorted,"
 			   "art_ns,stail_ns,stail_speedup,bulk_path,bulk_ns,bulk_speedup,"
 			   "guard_ns,verify\n");
 	printf("%s,%zu,%llu,%llu,%.3f,%s,%.2f,%.2f,%.3f,%s,%.2f,%.3f,%.3f,%s\n",
 		   file, nkeys, (unsigned long long) lo, (unsigned long long) hi,
 		   (double) ndistinct / (double) (hi - lo + 1),
-		   contiguous ? "yes" : "no",
+		   sorted_stream ? "yes" : "no",
 		   med[0] / nkeys * 1e9, med[1] / nkeys * 1e9, med[0] / med[1],
-		   contiguous ? "bulk" : "stail",
+		   sorted_stream ? "bulk" : "stail",
 		   med[2] / nkeys * 1e9, med[0] / med[2],
 		   guard_best / nkeys * 1e9,
 		   ok ? "ok" : "FAIL");

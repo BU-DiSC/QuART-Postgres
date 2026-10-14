@@ -114,7 +114,7 @@
  * - RT_SHMEM - if defined, the radix tree is created in the DSA area
  *	 so that multiple processes can access it simultaneously.
  * - RT_DEBUG - if defined add stats tracking and debugging functions
- * - RT_USE_QUART - if defined, enable QuART stail_reset_bidir optimization
+ * - RT_USE_QUART - if defined, enable QuART stail fast-path insertion
  *   for sequential insertion patterns
  *
  * Interface
@@ -248,23 +248,8 @@
 #define RT_NODE_ITERATE_NEXT RT_MAKE_NAME(node_iterate_next)
 #define RT_VERIFY_NODE RT_MAKE_NAME(verify_node)
 #ifdef RT_USE_QUART
-#define RT_QUART_FAST_PATH RT_MAKE_NAME(quart_fast_path)
-#define RT_QUART_CHECK_ASCENDING RT_MAKE_NAME(quart_check_ascending)
-#define RT_QUART_CHECK_DESCENDING RT_MAKE_NAME(quart_check_descending)
-#define RT_QUART_UPDATE_FP RT_MAKE_NAME(quart_update_fp)
-/* quart.h internal helpers */
-#define RT_QUART_ADD_CHILD_4_CHANGE_FP		RT_MAKE_NAME(quart_add_child_4_change_fp)
-#define RT_QUART_ADD_CHILD_16_CHANGE_FP		RT_MAKE_NAME(quart_add_child_16_change_fp)
-#define RT_QUART_ADD_CHILD_48_CHANGE_FP		RT_MAKE_NAME(quart_add_child_48_change_fp)
-#define RT_QUART_ADD_CHILD_256_CHANGE_FP	RT_MAKE_NAME(quart_add_child_256_change_fp)
-#define RT_QUART_ADD_CHILD_4_PRESERVE_FP	RT_MAKE_NAME(quart_add_child_4_preserve_fp)
-#define RT_QUART_ADD_CHILD_16_PRESERVE_FP	RT_MAKE_NAME(quart_add_child_16_preserve_fp)
-#define RT_QUART_ADD_CHILD_48_PRESERVE_FP	RT_MAKE_NAME(quart_add_child_48_preserve_fp)
-#define RT_QUART_ADD_CHILD_256_PRESERVE_FP	RT_MAKE_NAME(quart_add_child_256_preserve_fp)
-#define RT_NODE_INSERT_CHANGE_FP			RT_MAKE_NAME(node_insert_change_fp)
-#define RT_NODE_INSERT_PRESERVE_FP			RT_MAKE_NAME(node_insert_preserve_fp)
-#define RT_QUART_INSERT_RECURSIVE_CHANGE_FP		RT_MAKE_NAME(quart_insert_recursive_change_fp)
-#define RT_QUART_INSERT_RECURSIVE_PRESERVE_FP	RT_MAKE_NAME(quart_insert_recursive_preserve_fp)
+#define RT_QUART_LOCATE_FP RT_MAKE_NAME(quart_locate_fp)
+#define RT_QUART_STORE_VALUE RT_MAKE_NAME(quart_store_value)
 #endif
 
 /* type declarations */
@@ -292,7 +277,6 @@
 
 /* generate forward declarations necessary to use the radix tree */
 #ifdef RT_DECLARE
-#define RT_USE_QUART    
 
 typedef struct RT_RADIX_TREE RT_RADIX_TREE;
 typedef struct RT_ITER RT_ITER;
@@ -736,17 +720,14 @@ typedef struct RT_RADIX_TREE_CONTROL
 #endif
 
 #ifdef RT_USE_QUART
-	/* QuART fast path state */
-	uint64		fp_last_key;		/* Last key inserted via fast path */
-	uint8		fp_dir;				/* Fast path direction: 0=asc, 1=desc */
-	uint16		fp_reset_counter;	/* Reset counter */
-	bool		fp_initialized;		/* Whether fast path is initialized */
-	RT_PTR_ALLOC fp;				/* Cached leaf-parent node pointer */
-	RT_PTR_ALLOC *fp_ref;			/* Pointer to slot holding fp in its parent */
-	RT_PTR_ALLOC fp_leaf;			/* Last inserted leaf pointer */
-	int			fp_shift;			/* Shift level of the fp node */
-	RT_PTR_ALLOC fp_path[RT_MAX_LEVEL]; /* Path from root to fp */
-	int			fp_path_length;		/* Number of entries in fp_path */
+	/*
+	 * QuART stail fast path state.  "fp" is the shift-0 node (the parent of
+	 * the leaves) holding the 256-key group "fp_group" (= key >> RT_SPAN).
+	 * fp is invalid (RT_INVALID_PTR_ALLOC) when no fast path is established.
+	 */
+	RT_PTR_ALLOC fp;
+	uint64		fp_group;
+	int			fp_reset_counter;
 #endif
 }			RT_RADIX_TREE_CONTROL;
 
@@ -990,6 +971,12 @@ RT_FREE_NODE(RT_RADIX_TREE * tree, RT_CHILD_PTR node)
 
 	tree->ctl->num_nodes[i]--;
 	Assert(tree->ctl->num_nodes[i] >= 0);
+#endif
+
+#ifdef RT_USE_QUART
+	/* the cached QuART fast-path node is being grown, shrunk or deleted */
+	if (node.alloc == tree->ctl->fp)
+		tree->ctl->fp = RT_INVALID_PTR_ALLOC;
 #endif
 
 #ifdef RT_SHMEM
@@ -2311,10 +2298,9 @@ RT_CREATE(MemoryContext ctx)
 
 #ifdef RT_USE_QUART
 	/* Initialize QuART fast path state */
-	tree->ctl->fp_dir = true;
-	tree->ctl->fp_reset_counter = 300;
-	tree->ctl->fp_last_key = 0;
-	tree->ctl->fp_initialized = false;
+	tree->ctl->fp = RT_INVALID_PTR_ALLOC;
+	tree->ctl->fp_group = 0;
+	tree->ctl->fp_reset_counter = RT_QUART_RESET_COUNTER_INIT;
 #endif
 
 	return tree;
@@ -3430,23 +3416,10 @@ RT_DUMP_NODE(RT_NODE * node)
 #ifdef RT_USE_QUART
 #undef RT_SET_QUART
 #undef RT_SET_QUART_BULK
-#undef RT_QUART_FAST_PATH
-#undef RT_QUART_CHECK_ASCENDING
-#undef RT_QUART_CHECK_DESCENDING
-#undef RT_QUART_UPDATE_FP
-#undef RT_QUART_ADD_CHILD_4_CHANGE_FP
-#undef RT_QUART_ADD_CHILD_16_CHANGE_FP
-#undef RT_QUART_ADD_CHILD_48_CHANGE_FP
-#undef RT_QUART_ADD_CHILD_256_CHANGE_FP
-#undef RT_QUART_ADD_CHILD_4_PRESERVE_FP
-#undef RT_QUART_ADD_CHILD_16_PRESERVE_FP
-#undef RT_QUART_ADD_CHILD_48_PRESERVE_FP
-#undef RT_QUART_ADD_CHILD_256_PRESERVE_FP
-#undef RT_NODE_INSERT_CHANGE_FP
-#undef RT_NODE_INSERT_PRESERVE_FP
-#undef RT_QUART_INSERT_RECURSIVE_CHANGE_FP
-#undef RT_QUART_INSERT_RECURSIVE_PRESERVE_FP
+#undef RT_QUART_LOCATE_FP
+#undef RT_QUART_STORE_VALUE
 #endif
+#undef RT_USE_QUART
 #undef RT_BEGIN_ITERATE
 #undef RT_ITERATE_NEXT
 #undef RT_END_ITERATE
